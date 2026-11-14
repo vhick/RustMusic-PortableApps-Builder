@@ -1,0 +1,155 @@
+name: RustMusic PortableApps - Source Build
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'latest or explicit stable version (e.g. v0.4.4)'
+        required: true
+        type: string
+        default: latest
+      publish:
+        description: 'Publish validated packages to Releases'
+        type: boolean
+        required: true
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: rustmusic-portable-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: 'true'
+      RUST_BACKTRACE: '1'
+      CARGO_BUILD_JOBS: '2'
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
+      BUILDER_REVISION: 'b1r1'
+      REQUESTED_VERSION: ${{ inputs.version }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout independent builder
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run static builder tests
+        run: python -m unittest discover -s tests -v
+      - name: Resolve stable release and fetch exact upstream tagged source
+        id: upstream
+        run: |
+          python scripts/resolve_upstream.py --version "$env:REQUESTED_VERSION" --source work/upstream --revision "$env:BUILDER_REVISION" --evidence work/build-identity.json
+      - name: Confirm source integrity and known pin interfaces
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          python scripts/check_action_contracts.py --out work/action-contracts.json
+          git -C work/upstream rev-parse HEAD
+          git -C work/upstream status --short
+      - name: Setup Node 22
+        if: steps.upstream.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: work/upstream/package-lock.json
+      - name: Install Rust x64 MSVC
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cmake --version
+      - name: Apply application-specific storage, updater and identity patches
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          python scripts/portable_adapter.py --source work/upstream --evidence work/adapter-evidence.json
+      - name: Install locked Node dependencies
+        if: steps.upstream.outputs.exists != 'true'
+        working-directory: work/upstream
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+      - name: Compile real upstream RustMusic from source (no standard installer)
+        if: steps.upstream.outputs.exists != 'true'
+        working-directory: work/upstream
+        run: |
+          npm run tauri build -- --no-bundle --ci
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri source build failed' }
+          if (-not (Test-Path -LiteralPath 'src-tauri/target/release/RustMusic.exe')) { throw 'Actual source-built RustMusic.exe not found' }
+          $lock=(Get-FileHash 'src-tauri/Cargo.lock' -Algorithm SHA256).Hash.ToLower()
+          $expected=(Get-Content '..\build-identity.json' -Raw | ConvertFrom-Json).dependency_lock_sha256.'src-tauri/Cargo.lock'
+          if ($lock -ne $expected) { throw 'Cargo.lock changed: non-reproducible dependency resolution' }
+      - name: Compile original genuine Windows launcher with Visual C++
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          ./scripts/compile_launcher.ps1 -OutFile 'work/launcher/RustMusicPortable.exe'
+      - name: Stage, generate correctly sized upstream icons and package ZIP + complete modified GPL source
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          python scripts/package_portable.py --root work/RustMusicPortable --executable work/upstream/src-tauri/target/release/RustMusic.exe --launcher work/launcher/RustMusicPortable.exe --source work/upstream --identity work/build-identity.json --evidence work/adapter-evidence.json --dist dist
+      - name: Independently validate PortableApps package and ZIP
+        if: steps.upstream.outputs.exists != 'true'
+        run: |
+          $zipName = 'RustMusicPortable_{0}_{1}_Win64.zip' -f '${{ steps.upstream.outputs.version }}', $env:BUILDER_REVISION
+          python scripts/validate_portable.py --stage work/RustMusicPortable --zip (Join-Path 'dist' $zipName)
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP validation failed' }
+      - name: Build PortableApps-style installer through pinned shared builder
+        id: installer
+        if: steps.upstream.outputs.exists != 'true'
+        continue-on-error: true
+        uses: vhick/Portable-Package-Builder@v1.0.0
+        with:
+          source-dir: work/RustMusicPortable
+          output-dir: dist
+          engine: custom-nsis
+          running-exe: 'App\RustMusic\RustMusic.exe'
+          package-revision: b1r1
+          timeout-seconds: '1200'
+      - name: Independently validate actual installer when generated
+        id: installer_validation
+        if: steps.upstream.outputs.exists != 'true' && steps.installer.outcome == 'success'
+        continue-on-error: true
+        env:
+          INSTALLER_FILE: ${{ steps.installer.outputs.installer-file }}
+          INSTALLER_SHA: ${{ steps.installer.outputs.installer-sha256 }}
+        run: |
+          ./scripts/validate_installer.ps1 -Installer $env:INSTALLER_FILE -ExpectedSha $env:INSTALLER_SHA
+      - name: Quarantine failed or unvalidated installer; never publish it
+        if: steps.upstream.outputs.exists != 'true' && (steps.installer.outcome != 'success' || steps.installer_validation.outcome != 'success')
+        run: |
+          Get-ChildItem -Path dist -Filter '*.paf.exe' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          Write-Host 'Unvalidated installer removed from release inputs; validated ZIP/source ZIP preserved.'
+      - name: Release publisher preflight (always dry run first)
+        if: steps.upstream.outputs.exists != 'true'
+        uses: vhick/portable-release-publisher@v1.1.1
+        with:
+          files: 'dist/*.zip;dist/*.paf.exe'
+          tag: ${{ steps.upstream.outputs.release_tag }}
+          release-title: RustMusic PortableApps ${{ steps.upstream.outputs.version }} (b1r1)
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'true'
+      - name: Publish validated assets (ZIP remains available on installer failure)
+        if: steps.upstream.outputs.exists != 'true' && inputs.publish
+        uses: vhick/portable-release-publisher@v1.1.1
+        with:
+          files: 'dist/*.zip;dist/*.paf.exe'
+          tag: ${{ steps.upstream.outputs.release_tag }}
+          release-title: RustMusic PortableApps ${{ steps.upstream.outputs.version }} (b1r1)
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'false'
+      - name: Show installer failure distinctly from ZIP success
+        if: steps.upstream.outputs.exists != 'true' && (steps.installer.outcome != 'success' || steps.installer_validation.outcome != 'success')
+        run: |
+          throw 'PortableApps ZIP/source ZIP validation passed but installer creation or independent inspection failed. ZIP is preserved. Never treat this as a successful installer build.'
+      - name: Skip exact already-published source/build/revision
+        if: steps.upstream.outputs.exists == 'true'
+        run: |
+          Write-Host 'Identical release tag already exists; no redundant compilation/publication.'

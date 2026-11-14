@@ -1,0 +1,111 @@
+name: RustMusic PortableApps - Installer Only
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Existing validated RustMusic builder Release tag'
+        required: true
+        type: string
+      source_asset:
+        description: 'Exact RustMusicPortable_*_Win64.zip filename'
+        required: true
+        type: string
+      output_tag:
+        description: 'NEW portable- prefixed Release tag, different from source_tag'
+        required: true
+        type: string
+      publish:
+        description: 'Publish verified ZIP + installer to NEW release'
+        type: boolean
+        required: true
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: rustmusic-installer-${{ inputs.output_tag }}
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
+      SOURCE_TAG: ${{ inputs.source_tag }}
+      SOURCE_ASSET: ${{ inputs.source_asset }}
+      OUTPUT_TAG: ${{ inputs.output_tag }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check exact existing/source target tags
+        run: |
+          $source=$env:SOURCE_TAG;$target=$env:OUTPUT_TAG
+          if ($source -notmatch '^portable-rustmusic-v[0-9]') { throw 'Source tag is not a RustMusic builder release' }
+          if ($target -notmatch '^portable-[A-Za-z0-9_.-]+$' -or $target -eq $source) { throw 'Specify a NEW portable- output_tag' }
+          $asset=$env:SOURCE_ASSET
+          if ($asset -notmatch '^RustMusicPortable_[0-9]+\.[0-9]+\.[0-9]+_[A-Za-z0-9._-]+_Win64\.zip$') { throw 'Invalid exact ZIP asset name' }
+      - name: Download only explicitly named release ZIP + publisher hashes
+        run: |
+          New-Item -ItemType Directory -Force -Path work/download, dist | Out-Null
+          & gh release download $env:SOURCE_TAG --repo "$env:GITHUB_REPOSITORY" --pattern $env:SOURCE_ASSET --pattern 'SHA256SUMS.txt' --dir work/download --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          python scripts/verify_release.py --folder work/download --asset $env:SOURCE_ASSET
+          if ($LASTEXITCODE -ne 0) { throw 'Untrusted release input ZIP' }
+      - name: Safely extract and revalidate package structure
+        run: |
+          python scripts/validate_portable.py --zip (Join-Path 'work/download' $env:SOURCE_ASSET) --extract 'work/extracted'
+          if ($LASTEXITCODE -ne 0) { throw 'Extraction/static verification failed' }
+          Copy-Item -LiteralPath (Join-Path 'work/download' $env:SOURCE_ASSET) -Destination dist
+      - name: Shared installer builder, no upstream compilation
+        id: installer
+        continue-on-error: true
+        uses: vhick/Portable-Package-Builder@v1.0.0
+        with:
+          source-dir: work/extracted/RustMusicPortable
+          output-dir: dist
+          engine: custom-nsis
+          running-exe: 'App\RustMusic\RustMusic.exe'
+          package-revision: b1r1
+          timeout-seconds: '1200'
+      - name: Independently validate created installer
+        id: check
+        if: steps.installer.outcome == 'success'
+        continue-on-error: true
+        env:
+          INSTALLER_FILE: ${{ steps.installer.outputs.installer-file }}
+          INSTALLER_SHA: ${{ steps.installer.outputs.installer-sha256 }}
+        run: |
+          ./scripts/validate_installer.ps1 -Installer $env:INSTALLER_FILE -ExpectedSha $env:INSTALLER_SHA
+      - name: Quarantine failed or unvalidated installer; retain verified ZIP
+        if: steps.installer.outcome != 'success' || steps.check.outcome != 'success'
+        run: |
+          Get-ChildItem -Path dist -Filter '*.paf.exe' -File -ErrorAction SilentlyContinue | Remove-Item -Force
+          Write-Host 'Installer excluded from publisher inputs; trusted original ZIP preserved.'
+      - name: Publisher preflight only
+        uses: vhick/portable-release-publisher@v1.1.1
+        with:
+          files: 'dist/*.zip;dist/*.paf.exe'
+          tag: ${{ inputs.output_tag }}
+          release-title: RustMusic PortableApps installer rebuild
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'true'
+      - name: Publish original validated ZIP and new installer
+        if: inputs.publish
+        uses: vhick/portable-release-publisher@v1.1.1
+        with:
+          files: 'dist/*.zip;dist/*.paf.exe'
+          tag: ${{ inputs.output_tag }}
+          release-title: RustMusic PortableApps installer rebuild
+          keep-releases: '3'
+          prune: 'false'
+          dry-run: 'false'
+      - name: Flag non-success installer distinct from preserved ZIP
+        if: steps.installer.outcome != 'success' || steps.check.outcome != 'success'
+        run: |
+          throw 'Installer generation or its independent validation failed. Original validated ZIP was preserved.'

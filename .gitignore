@@ -1,0 +1,10 @@
+# CI work, downloaded upstream, compiled binaries and runtime artifacts
+work/
+dist/
+*.exe
+*.paf.exe
+*.zip
+__pycache__/
+*.pyc
+.vscode/
+*.log
